@@ -1,0 +1,44 @@
+# =============================================================================
+# Local development dependencies for Jupyter notebooks
+# =============================================================================
+# Install:  pip install -r notebooks/requirements-dev.txt
+# =============================================================================
+
+# Jupyter (pinned to match your installed version)
+jupyterlab==4.5.5
+ipykernel
+
+# AWS SDK
+boto3>=1.28
+botocore
+
+# Data
+pandas>=2.0
+numpy
+
+# Athena
+PyAthena[SQLAlchemy]>=3.0
+
+# PostgreSQL (RDS)
+psycopg2-binary>=2.9
+SQLAlchemy>=2.0
+
+# S3 file reading
+s3fs>=2023.6
+pyarrow>=12.0
+
+# Env management
+python-dotenv>=1.0
+
+# Azure SDK (for azure_unified_recommendations local dev)
+azure-identity>=1.14
+azure-mgmt-compute>=30.0
+azure-mgmt-containerservice>=28.0
+azure-mgmt-monitor>=6.0
+azure-mgmt-eventhub>=11.0
+azure-mgmt-redis>=14.0
+aiohttp>=3.9
+
+# Display / formatting
+tabulate
+IPython
