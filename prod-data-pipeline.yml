@@ -1,0 +1,203 @@
+trigger:
+  branches:
+    include:
+      - prod
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+parameters:
+- name: environment
+  displayName: "Target Environment"
+  type: string
+  default: prod
+  values:
+    - dev
+    - stage
+    - prod
+
+variables:
+  - group: prod-data-pipeline-aws
+
+steps:
+# ------------------------------
+# STEP 1: Setup Environment
+# ------------------------------
+- task: UsePythonVersion@0
+  inputs:
+    versionSpec: '3.x'
+
+- script: |
+    pip install awscli
+  displayName: 'Install AWS CLI'
+
+- script: |
+    sudo apt-get install -y jq
+  displayName: "Install jq"
+
+# ------------------------------
+# STEP: Sync Common and Config folders to S3
+# ------------------------------
+- script: |
+    set -e
+    BUCKET="finomics-data-team-pod"
+    BASE_PATH="warehouse/scripts"
+
+    echo "Syncing common and config folders to s3://${BUCKET}/${BASE_PATH}/"
+
+    # Upload 'common' folder
+    aws s3 sync "src/s3/scripts/common/" "s3://${BUCKET}/${BASE_PATH}/common/" --delete
+
+    # Upload 'config' folder
+    aws s3 sync "src/s3/scripts/config/" "s3://${BUCKET}/${BASE_PATH}/config/" --delete
+
+    echo "✅ S3 sync completed successfully!"
+  env:
+    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+    AWS_DEFAULT_REGION: us-east-1
+  displayName: 'Upload Common & Config Scripts to S3'
+
+# ------------------------------
+# STEP 2: Upload and Update Glue Jobs
+# ------------------------------
+- script: |
+    set -e
+    sudo apt-get update && sudo apt-get install -y jq
+
+    ENV="${{ parameters.environment }}"
+    JOBS_DIRS=("src/glue/aws" "src/glue/azure" "src/glue/oci" "src/glue/alibaba" "src/glue/gcp")
+    PYTHON_LIB_PATH="s3://finomics-data-team-pod/warehouse/scripts/common/utils.py"
+
+    for dir in "${JOBS_DIRS[@]}"; do
+      for file in $dir/*.py; do
+        filename=$(basename -- "$file")
+        base_name="${filename%.py}"
+        job_name="prod_${base_name}"
+
+        echo "Processing Glue job: $job_name from $file"
+
+        # Upload script to S3
+        aws s3 cp "$file" "s3://${S3_BUCKET}/prod/$filename"
+
+        # Check if Glue job exists
+        if aws glue get-job --job-name "$job_name" >/dev/null 2>&1; then
+          echo "Job $job_name exists. Updating..."
+          job_def=$(aws glue get-job --job-name "$job_name" --query 'Job' --output json)
+          cleaned_def=$(echo "$job_def" | jq 'del(.Name, .CreatedOn, .LastModifiedOn, .AllocatedCapacity, .MaxRetries, .MaxCapacity)')
+          updated_def=$(echo "$cleaned_def" | jq --arg loc "s3://${S3_BUCKET}/prod/$filename" --arg lib "$PYTHON_LIB_PATH" --arg role "$GLUE_ROLE" '.Command.ScriptLocation = $loc | .DefaultArguments["--extra-py-files"] = $lib | .Role = $role')
+          echo "$updated_def" > job-update.json
+          aws glue update-job --job-name "$job_name" --job-update file://job-update.json
+        else
+          echo "Job $job_name not found. Creating new job..."
+          aws glue create-job \
+            --name "$job_name" \
+            --role "${GLUE_ROLE}" \
+            --command "{\"Name\":\"glueetl\",\"ScriptLocation\":\"s3://${S3_BUCKET}/prod/${filename}\",\"PythonVersion\":\"3\"}" \
+            --default-arguments "{\"--job-language\":\"python\",\"--extra-py-files\":\"${PYTHON_LIB_PATH}\"}" \
+            --glue-version "5.0" \
+            --worker-type "G.1X" \
+            --number-of-workers 2 \
+            --tags "{\"cloud\":\"aws\",\"created_by\":\"devops\",\"environment\":\"prod\",\"application\":\"backend\"}"
+        fi
+      done
+    done
+  env:
+    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+    AWS_DEFAULT_REGION: us-east-1
+    GLUE_ROLE: $(GLUE_ROLE)
+    S3_BUCKET: $(S3_BUCKET)
+  displayName: 'Upload & Update/Create Glue Jobs'
+
+# ------------------------------
+# STEP 3: Upload and Update/Create Lambda Functions
+# ------------------------------
+- script: |
+    set -e
+    LAMBDA_DIR="src/lambda"
+    ENV="${{ parameters.environment }}"
+
+    for file in $LAMBDA_DIR/*.py; do
+      filename=$(basename -- "$file")
+      base_name="${filename%.py}"
+      lambda_name="prod_${base_name}"
+
+      echo "Processing Lambda: $lambda_name from $file"
+
+      zip_file="/tmp/${base_name}.zip"
+      zip -j "$zip_file" "$file"
+
+      aws s3 cp "$zip_file" "s3://${S3_BUCKET}/lambda/${lambda_name}.zip"
+
+      # Check if Lambda exists
+      if aws lambda get-function --function-name "$lambda_name" >/dev/null 2>&1; then
+        echo "Updating existing Lambda: $lambda_name"
+        aws lambda update-function-code --function-name "$lambda_name" --zip-file fileb://"$zip_file"
+        # ✅ Step 2: Wait for config update to finish before updating code
+        echo "Waiting for Lambda configuration update to complete..."
+        aws lambda wait function-updated --function-name "$lambda_name"
+        # ✅ Step 3: Update Lambda code
+        aws lambda update-function-configuration \
+          --function-name "$lambda_name" \
+          --timeout 900 \
+          --memory-size 1024 \
+          --environment "Variables={STEP_FUNCTION_ARN=arn:aws:states:us-east-1:364582896484:stateMachine:ProdGenericStepFunction,BUCKET=finomics-data-team-pod,ICEBERG_DB=prod_finomics_catalog_data,PREFIX=warehouse,RDS_SECRET_ARN=arn:aws:secretsmanager:us-east-1:364582896484:secret:finomics_demo_db_rds-jYmL3E,SLACK_API=https://slack.com/api,SLACK_BOT_TOKEN=xoxb-3495582696580-9551179859888-K17a4V0Ok8hawrkxNjG0BlTq,SLACK_CHANNEL_NAME=finomics-clients-onboarding,ENV=prod}"
+      else
+        echo "Creating new Lambda: $lambda_name"
+        aws lambda create-function \
+          --function-name "$lambda_name" \
+          --runtime python3.11 \
+          --role "${LAMBDA_ROLE}" \
+          --handler "${base_name}.lambda_handler" \
+          --zip-file fileb://"$zip_file" \
+          --memory-size 1024 \
+          --timeout 900 \
+          --environment "Variables={STEP_FUNCTION_ARN=arn:aws:states:us-east-1:364582896484:stateMachine:ProdGenericStepFunction,BUCKET=finomics-data-team-pod,ICEBERG_DB=prod_finomics_catalog_data,PREFIX=warehouse,RDS_SECRET_ARN=arn:aws:secretsmanager:us-east-1:364582896484:secret:finomics_demo_db_rds-jYmL3E,SLACK_API=https://slack.com/api,SLACK_BOT_TOKEN=xoxb-3495582696580-9551179859888-K17a4V0Ok8hawrkxNjG0BlTq,SLACK_CHANNEL_NAME=finomics-clients-onboarding,ENV=prod}" \
+          --tags "cloud=aws,created_by=devops,environment=${ENV},application=backend"
+      fi
+    done
+  env:
+    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+    AWS_DEFAULT_REGION: us-east-1
+    LAMBDA_ROLE: $(LAMBDA_ROLE)
+  displayName: 'Upload & Update/Create Lambda Functions'
+
+# ------------------------------
+# STEP 4: Update or Create Step Functions (Dynamic with Tags)
+# ------------------------------
+- script: |
+    set -e
+    STEP_DIR="src/step_function"
+
+    for STEP_FILE in $STEP_DIR/ProdGenericStepFunction.json; do
+      filename=$(basename -- "$STEP_FILE")
+      STEP_NAME="${filename%.json}"
+
+      echo "Processing Step Function: $STEP_NAME from $STEP_FILE"
+      definition=$(cat "$STEP_FILE")
+
+      arn="arn:aws:states:${AWS_DEFAULT_REGION}:${AWS_ACCOUNT_ID}:stateMachine:${STEP_NAME}"
+
+      if aws stepfunctions describe-state-machine --state-machine-arn "$arn" >/dev/null 2>&1; then
+        echo "Updating existing Step Function: $STEP_NAME"
+        aws stepfunctions update-state-machine \
+          --state-machine-arn "$arn" \
+          --definition "$definition"
+      else
+        echo "Creating new Step Function: $STEP_NAME"
+        aws stepfunctions create-state-machine \
+          --name "$STEP_NAME" \
+          --definition "$definition" \
+          --role-arn "${STEPFN_ROLE}" \
+          --tags key=cloud,value=aws key=created_by,value=devops key=environment,value=${{ parameters.environment }} key=application,value=backend
+      fi
+    done
+  env:
+    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+    AWS_DEFAULT_REGION: us-east-1
+    AWS_ACCOUNT_ID: $(AWS_ACCOUNT_ID)
+    STEPFN_ROLE: $(STEPFN_ROLE)
+  displayName: 'Update/Create Step Functions (Dynamic with Tags)'
